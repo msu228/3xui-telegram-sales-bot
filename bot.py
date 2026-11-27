@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import threading
 from aiogram import BaseMiddleware
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 import json
 import logging
@@ -855,6 +856,8 @@ def build_qr_photo(link: str) -> BufferedInputFile:
 
 async def send_promo_access(target_message: types.Message, tg_id: int):
     async with user_locks[tg_id]:
+        if blocked(tg_id, "vpn") or blocked(tg_id, "bot"):
+            raise RuntimeError("Access restricted")
         sub_uuid, email, already_exists = await panel_call(xui.process_user_promo, tg_id)
 
     sub_link = f"{XUI_PUBLIC_URL}/pablodirov/{sub_uuid}"
@@ -884,6 +887,8 @@ async def send_promo_access(target_message: types.Message, tg_id: int):
 
 async def send_premium_get_or_sync(target_message: types.Message, tg_id: int):
     async with user_locks[tg_id]:
+        if blocked(tg_id, "vpn") or blocked(tg_id, "bot"):
+            raise RuntimeError("Access restricted")
         sub_uuid, email, expiry_ms, already_exists = await panel_call(
             xui.get_or_sync_user_premium_3d, tg_id
         )
@@ -944,8 +949,13 @@ def valid_payment(payload, tg_id, currency, amount, checkout=False):
         return False
 
 async def trigger_premium_renew_action(target_message, tg_id):
+    if blocked(tg_id, "vpn") or blocked(tg_id, "bot"):
+        await target_message.answer("Оформление доступа ограничено. Используйте контакты поддержки.")
+        return
     if not RENEW_REQUIRES_STARS:
         async with user_locks[tg_id]:
+            if blocked(tg_id, "vpn") or blocked(tg_id, "bot"):
+                return
             result = await panel_call(xui.renew_user_premium_by_recreate, tg_id)
         await send_renew_result(target_message, result)
         return
@@ -956,6 +966,9 @@ async def trigger_premium_renew_action(target_message, tg_id):
 
 @dp.pre_checkout_query()
 async def on_pre_checkout_query(query):
+    if blocked(query.from_user.id, "bot") or blocked(query.from_user.id, "vpn"):
+        await query.answer(ok=False, error_message="Оформление доступа ограничено.")
+        return
     ok = valid_payment(query.invoice_payload, query.from_user.id, query.currency, query.total_amount, True)
     if ok:
         await query.answer(ok=True)
@@ -980,6 +993,14 @@ async def on_successful_payment(message):
             payment_store.put(charge, record)
             if not valid_payment(p.invoice_payload, uid, p.currency, p.total_amount):
                 await message.answer(f"Платёж требует проверки. /paysupport. ID: {charge}")
+                return
+            if blocked(uid, "vpn") or blocked(uid, "bot"):
+                await message.answer(f"Оплата получена и требует ручной проверки. /paysupport. ID: {charge}")
+                if SUPPORT_ADMIN_ID:
+                    try:
+                        await bot.send_message(SUPPORT_ADMIN_ID, f"Платёж заблокированного пользователя {uid}: {charge}. Требуется ручная проверка или возврат.")
+                    except TelegramAPIError:
+                        logging.warning("Payment review notification failed")
                 return
             payment_store.put(charge, {**record, "status": "processing"})
             result = await panel_call(xui.renew_user_premium_by_recreate, uid)
@@ -1182,6 +1203,9 @@ def support_keyboard():
 
 
 async def support_open(message, uid):
+    if blocked(uid, "mute"):
+        await message.answer("Отправка сообщений в поддержку ограничена. Используйте контакты.")
+        return
     if not SUPPORT_ADMIN_ID or uid == SUPPORT_ADMIN_ID:
         await message.answer("Для связи используйте контакты в разделе поддержки.")
         return
@@ -1245,6 +1269,180 @@ def support_route(message):
 
 
 
+# ==================== МОДЕРАЦИЯ ====================
+BAN_FILE = os.getenv("BANNED_USERS_FILE", "/root/xui-bot/banned_users.json")
+ban_store = PaymentStore(BAN_FILE)
+
+
+def blocked(uid, kind):
+    return bool(ban_store.records.get(str(uid), {}).get(kind))
+
+
+def moderation_keyboard(uid):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=("Снять " if blocked(uid, kind) else "") + label,
+                             callback_data=f"mod:{kind}:{uid}:{int(not blocked(uid, kind))}")
+    ] for kind, label in (("bot", "🚫 Бан бота"), ("mute", "🔇 Мут"), ("vpn", "⛔ Бан VPN"))])
+
+
+class ModerationMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if not user or user.id == SUPPORT_ADMIN_ID or getattr(event, "successful_payment", None):
+            return await handler(event, data)
+        uid = user.id
+        action = getattr(event, "data", None) or getattr(event, "text", None) or ""
+        if blocked(uid, "bot") and action not in ("/paysupport", "pay_help", "show_contacts", "📬 Контакты"):
+            if isinstance(event, types.CallbackQuery):
+                await event.answer("Доступ к боту ограничен.")
+            elif action == "/start":
+                await event.answer("Доступ к боту ограничен. " + CONTACT_EMAIL)
+            return
+        if blocked(uid, "vpn") and action in {"get_promo", "get_premium", "renew_premium_1m", "🎁 Промо-доступ", "💎 Получить премиум", "🔄 Продлить премиум (+30 дней)"}:
+            if isinstance(event, types.CallbackQuery):
+                await event.answer("Оформление доступа ограничено.")
+            else:
+                await event.answer("Оформление доступа ограничено.")
+            return
+        return await handler(event, data)
+
+
+def set_vpn_enabled(uid, enabled, restore=None):
+    # API update route is configurable because 3x-ui forks differ.
+    route = os.getenv("XUI_CLIENT_UPDATE_PATH", "/panel/api/clients/update/{email}")
+    clients = {}
+    for ib in xui.get_all_inbounds():
+        for cl in xui._parse_clients(ib):
+            email = cl.get("email")
+            if email in (f"tg_{uid}", f"prem_{uid}"):
+                clients.setdefault(email, []).append((int(ib["id"]), cl))
+    for email, entries in clients.items():
+        target = bool(restore.get(email, True)) if enabled and restore is not None else enabled
+        if all(bool(cl.get("enable")) == target for _, cl in entries):
+            continue
+        client = dict(entries[0][1], enable=target)
+        ids = [i for i, _ in entries]
+        from urllib.parse import quote
+        path = route.format(email=quote(email, safe=""), id=quote(str(client.get("id", "")), safe=""))
+        payload = {
+            **client,
+            "id": str(client["id"]),
+            "email": email,
+            "enable": target,
+            "inboundIds": ids,
+        }
+
+        res = xui.session.post(
+            xui.base_url + path,
+            json=payload,
+            timeout=10
+        )
+
+        if res.status_code != 200 or not res.json().get("success"):
+            raise RuntimeError(
+                f"Panel update failed (HTTP {res.status_code}): "
+                f"{res.json().get('msg', 'No message')}"
+            )
+    # Never claim success until the panel confirms all matching records.
+    for ib in xui.get_all_inbounds():
+        for cl in xui._parse_clients(ib):
+            email = cl.get("email")
+            if email in clients:
+                target = bool(restore.get(email, True)) if enabled and restore is not None else enabled
+                if bool(cl.get("enable")) != target:
+                    raise RuntimeError("Panel verification failed")
+    return len(clients)
+
+
+async def moderate(uid, kind, enabled):
+    if uid <= 0 or uid == SUPPORT_ADMIN_ID:
+        return "Недопустимый ID."
+    async with user_locks[uid]:
+        record = dict(ban_store.records.get(str(uid), {}))
+        if kind != "vpn":
+            record[kind] = enabled
+            ban_store.put(str(uid), record)
+            if enabled:
+                support_sessions.pop(uid, None)
+            return f"{kind}: {'включён' if enabled else 'снят'} для {uid}."
+        if enabled:
+            if not record.get("vpn"):
+                inbounds = await panel_call(xui.get_all_inbounds)
+                restore = {}
+                for ib in inbounds:
+                    for cl in xui._parse_clients(ib):
+                        if cl.get("email") in (f"tg_{uid}", f"prem_{uid}"):
+                            email = cl["email"]
+                            state = bool(cl.get("enable"))
+                            if email in restore and restore[email] != state:
+                                return "Разные статусы клиента в инбаундах. Требуется ручная проверка."
+                            restore[email] = state
+                record["vpn_restore"] = restore
+            record["vpn"] = True
+            ban_store.put(str(uid), record)
+        elif not record.get("vpn"):
+            return "VPN-бан не установлен."
+        try:
+            count = await panel_call(set_vpn_enabled, uid, not enabled, record.get("vpn_restore", {}))
+        except Exception as e:
+            logging.warning(
+    "VPN moderation failed: %s",
+    str(e) if type(e) is RuntimeError else type(e).__name__
+)
+            return "VPN: операция не подтверждена панелью. Блокировка в боте сохранена. Повторите команду или проверьте панель вручную."
+        if not enabled:
+            record["vpn"] = False
+            record.pop("vpn_restore", None)
+            ban_store.put(str(uid), record)
+        return f"VPN: {'отключён' if enabled else 'восстановлен'} для {uid}. Найдено профилей: {count}."
+
+
+@dp.message(Command("ban", "unban", "mute", "unmute", "banvpn", "unbanvpn", "banlist"))
+async def moderation_command(message):
+    if message.from_user.id != SUPPORT_ADMIN_ID:
+        return
+    parts = message.text.split()
+    cmd = parts[0].split("@")[0][1:]
+    if cmd == "banlist":
+        rows = [f"{uid}: " + ", ".join(k for k in ("bot", "mute", "vpn") if rec.get(k)) for uid, rec in ban_store.records.items() if any(rec.get(k) for k in ("bot", "mute", "vpn"))]
+        for i in range(0, len(rows), 50):
+            await message.answer("\n".join(rows[i:i+50]))
+        if not rows:
+            await message.answer("Список пуст.")
+        return
+    if len(parts) != 2 or not parts[1].isdigit() or len(parts[1]) > 16:
+        await message.answer(f"Использование: /{cmd} Telegram_ID")
+        return
+    kind = {"ban":"bot", "unban":"bot", "mute":"mute", "unmute":"mute", "banvpn":"vpn", "unbanvpn":"vpn"}[cmd]
+    try:
+        await message.answer(await moderate(int(parts[1]), kind, not cmd.startswith("un")))
+    except Exception:
+        logging.warning("Moderation command failed")
+        await message.answer("Не удалось выполнить операцию. Проверьте журнал и панель.")
+
+
+@dp.callback_query(F.data.startswith("mod:"))
+async def moderation_callback(callback):
+    if callback.from_user.id != SUPPORT_ADMIN_ID:
+        await callback.answer()
+        return
+    _, kind, uid, enabled = callback.data.split(":")
+    if kind not in ("bot", "mute", "vpn") or not uid.isdigit() or enabled not in ("0", "1"):
+        await callback.answer()
+        return
+    await callback.answer()
+    try:
+        await callback.message.answer(await moderate(int(uid), kind, enabled == "1"))
+        await callback.message.edit_reply_markup(reply_markup=moderation_keyboard(int(uid)))
+    except Exception:
+        logging.warning("Moderation callback failed")
+        await callback.message.answer("Не удалось выполнить операцию. Проверьте панель.")
+
+
+dp.message.outer_middleware(ModerationMiddleware())
+dp.callback_query.outer_middleware(ModerationMiddleware())
+
+
 @dp.message(F.from_user.id == SUPPORT_ADMIN_ID, F.reply_to_message)
 async def support_admin_reply(message):
     uid = support_route(message)
@@ -1270,6 +1468,8 @@ def support_is_active(message):
 @dp.message(support_is_active)
 async def support_receive(message):
     uid = message.from_user.id
+    if blocked(uid, "mute") or blocked(uid, "bot"):
+        return
     if not support_media_ok(message):
         await message.answer("Пришлите текст, фото или изображение файлом до 20 МБ.")
         return
@@ -1289,6 +1489,7 @@ async def support_receive(message):
     try:
         async with support_slots:
             header = await bot.send_message(SUPPORT_ADMIN_ID, f"SUPPORT:{uid}:{support_tag(uid)}\n✉️ Обращение от {user.full_name}\nTelegram ID: {uid}\nUsername: @{user.username}\nОтветьте на этот заголовок." if user.username else f"SUPPORT:{uid}:{support_tag(uid)}\n✉️ Обращение от {user.full_name}\nTelegram ID: {uid}\nОтветьте на этот заголовок.")
+            await header.edit_reply_markup(reply_markup=moderation_keyboard(uid))
             try:
                 await bot.copy_message(chat_id=SUPPORT_ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id, reply_parameters=types.ReplyParameters(message_id=header.message_id))
             except Exception:
