@@ -56,14 +56,13 @@ DNS_TUNNEL_SERVER = os.environ["DNS_TUNNEL_SERVER"]
 DNS_TUNNEL_PASSWORD = os.environ["DNS_TUNNEL_PASSWORD"]
 
 # Отключаем предупреждения о самоподписанном SSL
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+#urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==================== НАСТРОЙКИ ====================
 
 # Локальный URL панели (через который бот стучится на сервере под капотом)
 
 # Публичный URL для клиентов без лишних путей
-#XUI_PUBLIC_URL = "https://acidlab.top"
 
 # Твой API-токен из панели (Настройки -> Безопасность -> API Token)
 
@@ -110,6 +109,11 @@ TERMS_NOTICE = "Пользуясь любыми услугами, вы согл�
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+dp.message.filter(F.chat.type == "private")
+dp.callback_query.filter(
+    F.message.chat.type == "private"
+)
 
 # Блокировки на уровне конкретного tg_id для предотвращения гонок при быстрых кликах
 user_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -298,7 +302,7 @@ class XUIClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.session = requests.Session()
-        self.session.verify = False
+        self.session.verify = True
         self.session.headers.update({
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
