@@ -1,4 +1,9 @@
 import asyncio
+import hmac
+import hashlib
+import threading
+from aiogram import BaseMiddleware
+from aiogram.filters import Command
 import json
 import logging
 import os
@@ -67,7 +72,7 @@ DNS_TUNNEL_PASSWORD = os.environ["DNS_TUNNEL_PASSWORD"]
 # Твой API-токен из панели (Настройки -> Безопасность -> API Token)
 
 # Список ID инбаундов для промо-подписок
-INBOUND_IDS = [18, 20, 27]
+INBOUND_IDS = [ 20, 27]
 
 # Список ID инбаундов для премиум-подписок
 PREMIUM_INBOUND_IDS = [4, 6, 7, 8, 12, 13, 15, 16]
@@ -116,89 +121,198 @@ dp.callback_query.filter(
 )
 
 # Блокировки на уровне конкретного tg_id для предотвращения гонок при быстрых кликах
-user_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+class UserLocks:
+    def __init__(self):
+        self.locks = [asyncio.Lock() for _ in range(1024)]
+    def __getitem__(self, uid):
+        return self.locks[uid % len(self.locks)]
+user_locks = UserLocks()
 
 
 class PaymentStore:
-    """Простое файловое хранилище обработанных ID платежей Telegram Stars"""
-
-    def __init__(self, filepath: str):
+    # Старый JSON-массив автоматически читается; новый формат хранит статусы.
+    def __init__(self, filepath):
         self.filepath = filepath
-        self._ids: set[str] = set()
-        self._load()
+        self.records = {}
+        if os.path.exists(filepath):
+            with open(filepath, encoding="utf-8") as f:
+                data = json.load(f)
+            self.records = ({str(x): {"status": "completed"} for x in data}
+                            if isinstance(data, list) else data)
+            if not isinstance(self.records, dict):
+                raise ValueError("Invalid payment journal")
 
-    def _load(self):
-        if os.path.isfile(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        self._ids = {str(x) for x in data}
-            except Exception as e:
-                logging.error(f"Не удалось прочитать {self.filepath}: {e}")
-
-    def _save(self):
-        parent = os.path.dirname(os.path.abspath(self.filepath))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp_path = f"{self.filepath}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(sorted(self._ids), f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self.filepath)
-
-    def has_processed(self, charge_id: str) -> bool:
-        return charge_id in self._ids
-
-    def mark_processed(self, charge_id: str):
-        if charge_id:
-            self._ids.add(charge_id)
-            self._save()
-
+    def put(self, key, record):
+        updated = dict(self.records)
+        updated[key] = record
+        os.makedirs(os.path.dirname(os.path.abspath(self.filepath)), exist_ok=True)
+        tmp = self.filepath + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(updated, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.filepath)
+        self.records = updated
+        fd = os.open(os.path.dirname(os.path.abspath(self.filepath)), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 payment_store = PaymentStore(PROCESSED_PAYMENTS_FILE)
 
+# Ограничение обычных действий, платежные события не отбрасываются.
 
-def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура внизу экрана при входе в чат"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="📊 Моя подписка"),
-                KeyboardButton(text="ℹ️ Инфо"),
-            ],
-            [
-                KeyboardButton(text="🎁 Промо-доступ"),
-                KeyboardButton(text="💎 Получить премиум"),
-            ],
-            [
-                KeyboardButton(text="🔄 Продлить премиум (+30 дней)"),
-                KeyboardButton(text="🌐 DNS-туннель (free)"),
-            ],
-            [
-                KeyboardButton(text="📘 Руководство пользования сетью"),
-                KeyboardButton(text="📬 Контакты"),
-            ],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Выберите действие в меню ниже...",
-    )
+class AntiFlood(BaseMiddleware):
+    def __init__(self):
+        self.pending = {}
+        self.last_heavy = {}
+        self.active = 0
+        self.max_active = 40
+        self.delay = 2.0
+
+        self.aliases = {
+            "📊 Моя подписка": "my_sub",
+            "🎁 Промо-доступ": "get_promo",
+            "💎 Получить премиум": "get_premium",
+            "🔄 Продлить премиум (+30 дней)": "renew_premium_1m",
+        }
+
+        self.heavy = {
+            "my_sub",
+            "get_promo",
+            "get_premium",
+            "renew_premium_1m",
+        }
+
+    async def acknowledge(self, event, text=None):
+        if isinstance(event, types.CallbackQuery):
+            try:
+                await event.answer(text=text)
+            except Exception:
+                pass
+
+    async def __call__(self, handler, event, data):
+        # Платежи не ограничиваем антифлудом.
+        if getattr(event, "successful_payment", None):
+            return await handler(event, data)
+
+        user = getattr(event, "from_user", None)
+        if not user:
+            return await handler(event, data)
+
+        uid = user.id
+        action = (
+            getattr(event, "data", None)
+            or getattr(event, "text", None)
+            or "unknown"
+        )
+        action = self.aliases.get(action, action)
+
+        now = time.monotonic()
+
+        if len(self.last_heavy) >= 10000:
+            self.last_heavy = {
+                k: v for k, v in self.last_heavy.items()
+                if now - v < 60
+            }
+
+        # Повторное нажатие не создаёт новый запрос.
+        actions = self.pending.get(uid, set())
+
+        if action in actions:
+            await self.acknowledge(event)
+            return
+
+        # Ограничиваем размер очереди.
+        if len(actions) >= 2 or self.active >= self.max_active:
+            await self.acknowledge(
+                event, "⏳ Секундочку..."
+            )
+            return
+
+        self.pending.setdefault(uid, set()).add(action)
+        self.active += 1
+
+        try:
+            if action in self.heavy:
+                now = time.monotonic()
+
+                scheduled = max(
+                    now,
+                    self.last_heavy.get(uid, 0) + self.delay
+                )
+
+                self.last_heavy[uid] = scheduled
+                wait = scheduled - now
+
+                if wait > 0:
+                    await self.acknowledge(
+                        event, "⏳ Обрабатываем запрос..."
+                    )
+                    await asyncio.sleep(wait)
+
+            return await handler(event, data)
+
+        finally:
+            self.active -= 1
+
+            actions = self.pending.get(uid)
+            if actions is not None:
+                actions.discard(action)
+                if not actions:
+                    self.pending.pop(uid, None)
 
 
-def get_start_inline_keyboard() -> InlineKeyboardMarkup:
-    """Инлайн-кнопки в приветственном сообщении"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Моя подписка", callback_data="my_sub")],
-            [InlineKeyboardButton(text="ℹ️ Инфо", callback_data="show_info")],
-            [InlineKeyboardButton(text="🎁 Промо-доступ", callback_data="get_promo")],
-            [InlineKeyboardButton(text="💎 Получить премиум", callback_data="get_premium")],
-            [InlineKeyboardButton(text="🔄 Продлить премиум (+30 дней)", callback_data="renew_premium_1m")],
-            [InlineKeyboardButton(text="🌐 DNS-туннель (free)", callback_data="get_dns_tunnel")],
-            [InlineKeyboardButton(text="📘 Руководство пользования сетью", callback_data="get_manual")],
-            [InlineKeyboardButton(text="📬 Контакты", callback_data="show_contacts")],
-        ]
-    )
+flood = AntiFlood()
+dp.message.middleware(flood)
+dp.callback_query.middleware(flood)
+panel_slots = asyncio.Semaphore(3)
+
+async def panel_call(fn, *args):
+    async with panel_slots:
+        return await asyncio.to_thread(fn, *args)
+
+MENUS = {
+    "subs": ("📊 Мои подписки", [("Посмотреть подписки", "my_sub"), ("Продлить премиум", "renew_premium_1m")]),
+    "tariffs": ("🛒 Тарифы и доступ", [("🎁 Промо-доступ", "get_promo"), ("💎 Пробный премиум", "get_premium"), ("⭐ Купить / продлить на 30 дней", "renew_premium_1m"), ("ℹ️ Инфо", "show_info")]),
+    "tools": ("🛠 Инструменты", [("🌐 DNS-туннель", "get_dns_tunnel"), ("📘 Руководство", "get_manual")]),
+    "support": ("💬 Поддержка", [("📬 Контакты", "show_contacts"), ("💳 Помощь с оплатой", "pay_help"), ("ℹ️ Условия", "show_info")]),
+}
+
+def get_main_reply_keyboard():
+    labels = [v[0] for v in MENUS.values()]
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=x) for x in labels[:2]], [KeyboardButton(text=x) for x in labels[2:]]], resize_keyboard=True, is_persistent=True)
+
+def section_keyboard(key):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=c)] for t,c in MENUS[key][1]] + [[InlineKeyboardButton(text="« Главное меню", callback_data="menu_home")]])
+
+def get_start_inline_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=v[0], callback_data="menu_"+k)] for k,v in MENUS.items()])
+
+@dp.message(F.text.in_([v[0] for v in MENUS.values()]))
+async def section_reply(message):
+    key = next(k for k,v in MENUS.items() if v[0] == message.text)
+    await message.answer(MENUS[key][0], reply_markup=section_keyboard(key))
+
+@dp.callback_query(F.data.startswith("menu_"))
+async def section_callback(callback):
+    key = callback.data[5:]
+    await callback.answer()
+    if key == "home":
+        await callback.message.edit_text("Главное меню", reply_markup=get_start_inline_keyboard())
+    elif key in MENUS:
+        await callback.message.edit_text(MENUS[key][0], reply_markup=section_keyboard(key))
+
+@dp.message(Command("paysupport"))
+async def pay_support(message):
+    await message.answer("По вопросам оплаты укажите ID платежа. Не отправляйте ссылку подписки.\n" + get_contacts_text(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "pay_help")
+async def pay_help(callback):
+    await callback.answer()
+    await pay_support(callback.message)
 
 
 def get_contacts_text() -> str:
@@ -252,10 +366,10 @@ def get_dns_tunnel_text() -> str:
             else:
                 resolvers_block = "📋 **Список резолверов:** файл пуст.\n\n"
         except Exception as e:
-            logging.error(f"Не удалось прочитать {RESOLVERS_FILE_PATH}: {e}")
-            resolvers_block = f"📋 **Список резолверов:** ошибка чтения файла (`{e}`)\n\n"
+            logging.error("Не удалось прочитать ")
+            resolvers_block = "📋 Список резолверов временно недоступен.\n\n"
     else:
-        resolvers_block = f"📋 **Список резолверов:** файл `{RESOLVERS_FILE_PATH}` не найден.\n\n"
+        resolvers_block = "📋 Список резолверов временно недоступен.\n\n"
 
     return (
         "🌐 **DNS-туннель (free)**\n\n"
@@ -301,13 +415,20 @@ class XUIClient:
     def __init__(self, base_url: str, token: str):
         self.base_url = base_url.rstrip("/")
         self.token = token
-        self.session = requests.Session()
-        self.session.verify = True
-        self.session.headers.update({
+        self._local = threading.local()
+
+    @property
+    def session(self):
+        if not hasattr(self._local, "session"):
+            session = requests.Session()
+            session.verify = True
+            session.headers.update({
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-        })
+            })
+            self._local.session = session
+        return self._local.session
 
     @staticmethod
     def _parse_clients(inbound_obj: dict) -> list[dict]:
@@ -328,20 +449,25 @@ class XUIClient:
             data = res.json()
             if data.get("success") and isinstance(data.get("obj"), list):
                 return data["obj"]
-        return []
+        raise RuntimeError("Panel list failed")
 
     def get_client_from_inbound(self, inbound_id: int, email: str) -> dict | None:
-        """Ищет клиента в конкретном инбаунде по email"""
-        url = f"{self.base_url}/panel/api/inbounds/get/{int(inbound_id)}"
-        res = self.session.get(url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("success"):
-                for client in self._parse_clients(data.get("obj", {})):
-                    if client.get("email") == email:
-                        return client
-        return None
+        """Ищет клиента в инбаунде через общий список."""
+        inbound_id = int(inbound_id)
 
+        for inbound in self.get_all_inbounds():
+            if int(inbound.get("id") or 0) != inbound_id:
+                continue
+
+            for client in self._parse_clients(inbound):
+                if client.get("email") == email:
+                    return client
+
+            return None
+
+        raise RuntimeError(
+            f"Inbound {inbound_id} not found in panel"
+        )
     def add_client_to_inbound(
         self,
         inbound_id: int,
@@ -377,7 +503,7 @@ class XUIClient:
         res = self.session.post(url, json=payload, timeout=10)
         ok = res.status_code == 200 and res.json().get("success", False)
         if not ok:
-            logging.warning(f"Не удалось добавить {email} в inbound {inbound_id}: {res.text}")
+            raise RuntimeError("Panel add failed")
         return ok
 
     def delete_client_by_email(self, email: str, inbound_id: int | None = None) -> bool:
@@ -396,11 +522,7 @@ class XUIClient:
         if res_del.status_code == 200 and res_del.json().get("success", False):
             return True
 
-        logging.warning(
-            f"Не удалось удалить клиента {email} (inbound={inbound_id}): "
-            f"POST={res.status_code} {res.text.strip()} | DELETE={res_del.status_code} {res_del.text.strip()}"
-        )
-        return False
+        raise RuntimeError("Panel delete failed")
 
     def _sync_inbounds_exact(
         self,
@@ -594,7 +716,12 @@ class XUIClient:
         email = f"prem_{tg_id}"
         existing = self._find_existing_premium_client(tg_id)
         if not existing:
-            return None
+            client_uuid, sub_uuid = str(uuid.uuid4()), str(uuid.uuid4())
+            expiry = int(time.time()*1000) + PREMIUM_RENEW_MS
+            self._sync_inbounds_exact(PREMIUM_INBOUND_IDS, email, tg_id,
+                                      client_uuid, sub_uuid, GROUP_PREMIUM,
+                                      PREMIUM_TOTAL_GB, expiry, PREMIUM_LIMIT_IP)
+            return sub_uuid, email, expiry, PREMIUM_TOTAL_GB
 
         client_uuid = str(existing.get("id") or uuid.uuid4())
         sub_uuid = str(existing.get("subId") or client_uuid)
@@ -711,7 +838,7 @@ try:
     xui = XUIClient(XUI_API_URL, API_TOKEN)
     logging.info("Клиент 3x-ui успешно инициализирован по токену!")
 except Exception as e:
-    logging.error(f"Ошибка инициализации X-UI: {e}")
+    logging.error("Ошибка инициализации X-UI")
     exit(1)
 
 
@@ -725,7 +852,7 @@ def build_qr_photo(link: str) -> BufferedInputFile:
 
 async def send_promo_access(target_message: types.Message, tg_id: int):
     async with user_locks[tg_id]:
-        sub_uuid, email, already_exists = await asyncio.to_thread(xui.process_user_promo, tg_id)
+        sub_uuid, email, already_exists = await panel_call(xui.process_user_promo, tg_id)
 
     sub_link = f"{XUI_PUBLIC_URL}/pablodirov/{sub_uuid}"
     photo = build_qr_photo(sub_link)
@@ -754,7 +881,7 @@ async def send_promo_access(target_message: types.Message, tg_id: int):
 
 async def send_premium_get_or_sync(target_message: types.Message, tg_id: int):
     async with user_locks[tg_id]:
-        sub_uuid, email, expiry_ms, already_exists = await asyncio.to_thread(
+        sub_uuid, email, expiry_ms, already_exists = await panel_call(
             xui.get_or_sync_user_premium_3d, tg_id
         )
 
@@ -787,85 +914,79 @@ async def send_premium_get_or_sync(target_message: types.Message, tg_id: int):
     )
 
 
-async def send_premium_renew(target_message: types.Message, tg_id: int):
-    async with user_locks[tg_id]:
-        result = await asyncio.to_thread(xui.renew_user_premium_by_recreate, tg_id)
+async def send_renew_result(message, result):
+    sub_uuid, email, expiry, total = result
+    link = f"{XUI_PUBLIC_URL}/pablodirov/{sub_uuid}"
+    await message.answer_photo(photo=build_qr_photo(link), caption=(
+        f"✅ Премиум активирован / продлён на {PREMIUM_RENEW_DAYS} дней!\n"
+        f"Лимит: {format_bytes(total)}\nДо: {format_expiry_human(expiry)}\n"
+        f"Ссылка: `{link}`\n{TERMS_NOTICE}"), parse_mode="Markdown")
 
-    if not result:
-        await target_message.answer(
-            "⚠️ У вас ещё нет премиум-профиля. Сначала нажмите **«💎 Получить премиум»** (бесплатно на 3 дня).\n\n"
-            f"{TERMS_NOTICE}",
-            parse_mode="Markdown",
-        )
-        return
+# Подписанный счёт: привязка к пользователю, цене и сроку действия.
+def make_payload(tg_id):
+    body = f"p1:{tg_id}:{STARS_RENEW_PRICE}:{int(time.time())}:{uuid.uuid4().hex[:16]}"
+    sig = hmac.new(BOT_TOKEN.encode(), body.encode(), hashlib.sha256).hexdigest()[:32]
+    return body + ":" + sig
 
-    sub_uuid, email, new_expiry_ms, new_total_gb = result
-    sub_link = f"{XUI_PUBLIC_URL}/pablodirov/{sub_uuid}"
-    photo = build_qr_photo(sub_link)
+def valid_payment(payload, tg_id, currency, amount, checkout=False):
+    try:
+        version, uid, price, ts, nonce, sig = payload.split(":")
+        body = payload.rsplit(":", 1)[0]
+        expected = hmac.new(BOT_TOKEN.encode(), body.encode(), hashlib.sha256).hexdigest()[:32]
+        return (version == "p1" and hmac.compare_digest(sig, expected)
+                and int(uid) == tg_id and currency == "XTR" and int(price) == amount
+                and amount > 0 and (not checkout or (amount == STARS_RENEW_PRICE
+                and 0 <= time.time()-int(ts) <= 3600)))
+    except (ValueError, TypeError):
+        return False
 
-    await target_message.answer_photo(
-        photo=photo,
-        caption=(
-            f"🔄 **Премиум-доступ продлён на +{PREMIUM_RENEW_DAYS} дней!**\n"
-            f"📦 **Новый лимит трафика:** `{format_bytes(new_total_gb)}` (с учётом остатка)\n"
-            f"⏳ **Новый срок действия до:** `{format_expiry_human(new_expiry_ms)}`\n\n"
-            "🔗 **Ваша ссылка на подписку:**\n"
-            f"`{sub_link}`\n\n"
-            f"{TERMS_NOTICE}"
-        ),
-        parse_mode="Markdown",
-    )
-
-
-async def trigger_premium_renew_action(target_message: types.Message, tg_id: int):
-    """Запускает продление напрямую (если RENEW_REQUIRES_STARS=False) или выставляет счёт в Stars"""
+async def trigger_premium_renew_action(target_message, tg_id):
     if not RENEW_REQUIRES_STARS:
-        await send_premium_renew(target_message, tg_id)
+        async with user_locks[tg_id]:
+            result = await panel_call(xui.renew_user_premium_by_recreate, tg_id)
+        await send_renew_result(target_message, result)
         return
-
-    payload = f"prem_stars:renew:{tg_id}:{int(time.time())}"
     await target_message.answer_invoice(
-        title=f"Продление Премиум (+{PREMIUM_RENEW_DAYS} дней)",
-        description="Продление срока действия на +30 дней и добавление остатка трафика. Сервис As Is.",
-        payload=payload,
-        currency="XTR",
-        prices=[LabeledPrice(label="Продление на 30 дней", amount=STARS_RENEW_PRICE)],
-    )
-
+        title="Премиум на 30 дней", description="Создание или продление подписки на 30 дней, 1 ТБ плюс остаток.",
+        payload=make_payload(tg_id), currency="XTR", provider_token="",
+        prices=[LabeledPrice(label="30 дней", amount=STARS_RENEW_PRICE)])
 
 @dp.pre_checkout_query()
-async def on_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
-    await pre_checkout_query.answer(ok=True)
-
+async def on_pre_checkout_query(query):
+    ok = valid_payment(query.invoice_payload, query.from_user.id, query.currency, query.total_amount, True)
+    if ok:
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Счёт устарел или недействителен. Создайте новый.")
 
 @dp.message(F.successful_payment)
-async def on_successful_payment(message: types.Message):
-    payment = message.successful_payment
-    charge_id = payment.telegram_payment_charge_id or ""
-    tg_id = message.from_user.id
-    payload = payment.invoice_payload or ""
-
-    if charge_id and payment_store.has_processed(charge_id):
-        logging.warning(f"Повторный вебхук/сообщение по уже обработанному charge_id={charge_id}")
-        await message.answer("ℹ️ Этот платёж уже был учтён ранее.")
-        return
-
-    logging.info(
-        f"Оплата Stars принята: tg_id={tg_id}, amount={payment.total_amount} {payment.currency}, "
-        f"charge_id={charge_id}, payload={payload}"
-    )
-
-    try:
-        await send_premium_renew(message, tg_id)
-        if charge_id:
-            payment_store.mark_processed(charge_id)
-    except Exception as e:
-        logging.error(f"Ошибка продления после оплаты Stars (charge_id={charge_id}): {e}")
-        await message.answer(
-            f"✅ Оплата прошла, но при обновлении панели возникла ошибка: `{e}`\n"
-            f"ID платежа для обращения: `{charge_id}`",
-            parse_mode="Markdown",
-        )
+async def on_successful_payment(message):
+    p = message.successful_payment
+    uid = message.from_user.id
+    charge = p.telegram_payment_charge_id
+    async with user_locks[uid]:
+        if not charge:
+            await message.answer("Не удалось идентифицировать платёж. Обратитесь в /paysupport.")
+            return
+        old = payment_store.records.get(charge)
+        if old:
+            await message.answer("Платёж уже учтён." if old["status"] == "completed" else "Платёж требует проверки. Обратитесь в /paysupport.")
+            return
+        record = {"tg_id": uid, "amount": p.total_amount, "payload": p.invoice_payload, "status": "review"}
+        try:
+            payment_store.put(charge, record)
+            if not valid_payment(p.invoice_payload, uid, p.currency, p.total_amount):
+                await message.answer(f"Платёж требует проверки. /paysupport. ID: {charge}")
+                return
+            payment_store.put(charge, {**record, "status": "processing"})
+            result = await panel_call(xui.renew_user_premium_by_recreate, uid)
+            payment_store.put(charge, {**record, "status": "completed"})
+        except Exception:
+            logging.error("Payment processing failed; manual reconciliation required")
+            await message.answer(f"Оплата получена, но активация требует проверки. /paysupport. ID: {charge}")
+            return
+    # Ошибка доставки QR не должна приводить к повторному продлению.
+    await send_renew_result(message, result)
 
 
 async def send_manual_pdf(target_message: types.Message):
@@ -899,11 +1020,11 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "📊 Моя подписка")
 async def reply_my_sub(message: types.Message):
     try:
-        summary = await asyncio.to_thread(xui.get_user_subscriptions_summary, message.from_user.id)
+        summary = await panel_call(xui.get_user_subscriptions_summary, message.from_user.id)
         await message.answer(summary, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"Ошибка получения сводки подписки: {e}")
-        await message.answer(f"❌ Не удалось получить данные подписки: {e}")
+        logging.error("Ошибка получения сводки подписки")
+        await message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 @dp.message(F.text == "ℹ️ Инфо")
@@ -922,8 +1043,13 @@ async def reply_promo(message: types.Message):
     try:
         await send_promo_access(message, message.from_user.id)
     except Exception as e:
-        logging.error(f"Ошибка создания промо-клиента: {e}")
-        await message.answer(f"❌ Произошла ошибка: {e}")
+        logging.error(
+    "Ошибка создания промо-клиента: %s",
+    type(e).__name__ + (
+        ": " + str(e) if type(e) is RuntimeError else ""
+    )
+)
+        await message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
     finally:
         await wait_msg.delete()
 
@@ -934,8 +1060,8 @@ async def reply_premium_get(message: types.Message):
     try:
         await send_premium_get_or_sync(message, message.from_user.id)
     except Exception as e:
-        logging.error(f"Ошибка получения/синхронизации премиум-клиента: {e}")
-        await message.answer(f"❌ Произошла ошибка: {e}")
+        logging.error("Ошибка получения/синхронизации премиум-клиента")
+        await message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
     finally:
         await wait_msg.delete()
 
@@ -945,8 +1071,8 @@ async def reply_premium_renew(message: types.Message):
     try:
         await trigger_premium_renew_action(message, tg_id=message.from_user.id)
     except Exception as e:
-        logging.error(f"Ошибка продления премиума: {e}")
-        await message.answer(f"❌ Не удалось выполнить продление: {e}")
+        logging.error("Ошибка продления премиума")
+        await message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 @dp.message(F.text == "🌐 DNS-туннель (free)")
@@ -959,8 +1085,8 @@ async def reply_manual(message: types.Message):
     try:
         await send_manual_pdf(message)
     except Exception as e:
-        logging.error(f"Ошибка отправки руководства: {e}")
-        await message.answer(f"❌ Не удалось отправить файл: {e}")
+        logging.error("Ошибка отправки руководства")
+        await message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 # --- Обработчики inline-кнопок ---
@@ -968,11 +1094,11 @@ async def reply_manual(message: types.Message):
 async def cb_my_sub(callback: types.CallbackQuery):
     await callback.answer("Загружаем данные подписки...")
     try:
-        summary = await asyncio.to_thread(xui.get_user_subscriptions_summary, callback.from_user.id)
+        summary = await panel_call(xui.get_user_subscriptions_summary, callback.from_user.id)
         await callback.message.answer(summary, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"Ошибка получения сводки подписки: {e}")
-        await callback.message.answer(f"❌ Не удалось получить данные подписки: {e}")
+        logging.error("Ошибка получения сводки подписки")
+        await callback.message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 @dp.callback_query(F.data == "show_info")
@@ -993,8 +1119,8 @@ async def cb_promo(callback: types.CallbackQuery):
     try:
         await send_promo_access(callback.message, callback.from_user.id)
     except Exception as e:
-        logging.error(f"Ошибка создания промо-клиента: {e}")
-        await callback.message.answer(f"❌ Произошла ошибка: {e}")
+        logging.exception("Ошибка создания промо-клиента")
+        await callback.message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 @dp.callback_query(F.data == "get_premium")
@@ -1003,8 +1129,8 @@ async def cb_premium_get(callback: types.CallbackQuery):
     try:
         await send_premium_get_or_sync(callback.message, callback.from_user.id)
     except Exception as e:
-        logging.error(f"Ошибка получения/синхронизации премиум-клиента: {e}")
-        await callback.message.answer(f"❌ Произошла ошибка: {e}")
+        logging.error("Ошибка получения/синхронизации премиум-клиента")
+        await callback.message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 @dp.callback_query(F.data == "renew_premium_1m")
@@ -1013,8 +1139,8 @@ async def cb_premium_renew(callback: types.CallbackQuery):
     try:
         await trigger_premium_renew_action(callback.message, tg_id=callback.from_user.id)
     except Exception as e:
-        logging.error(f"Ошибка продления премиума: {e}")
-        await callback.message.answer(f"❌ Не удалось выполнить продление: {e}")
+        logging.error("Ошибка продления премиума")
+        await callback.message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 @dp.callback_query(F.data == "get_dns_tunnel")
@@ -1029,8 +1155,8 @@ async def cb_manual(callback: types.CallbackQuery):
     try:
         await send_manual_pdf(callback.message)
     except Exception as e:
-        logging.error(f"Ошибка отправки руководства: {e}")
-        await callback.message.answer(f"❌ Не удалось отправить файл: {e}")
+        logging.error("Ошибка отправки руководства")
+        await callback.message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 
 async def on_startup(bot: Bot):
@@ -1040,7 +1166,7 @@ async def on_startup(bot: Bot):
 async def main():
     dp.startup.register(on_startup)
     logging.info("Бот запущен и ожидает сообщения...")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, tasks_concurrency_limit=64)
 
 
 if __name__ == "__main__":
