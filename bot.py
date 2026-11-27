@@ -203,6 +203,8 @@ class AntiFlood(BaseMiddleware):
             return await handler(event, data)
 
         uid = user.id
+        if isinstance(event, types.Message) and getattr(data.get("handler"), "callback", None) in (support_receive, support_admin_reply):
+            return await handler(event, data)
         action = (
             getattr(event, "data", None)
             or getattr(event, "text", None)
@@ -278,7 +280,7 @@ MENUS = {
     "subs": ("📊 Мои подписки", [("Посмотреть подписки", "my_sub"), ("Продлить премиум", "renew_premium_1m")]),
     "tariffs": ("🛒 Тарифы и доступ", [("🎁 Промо-доступ", "get_promo"), ("💎 Пробный премиум", "get_premium"), ("⭐ Купить / продлить на 30 дней", "renew_premium_1m"), ("ℹ️ Инфо", "show_info")]),
     "tools": ("🛠 Инструменты", [("🌐 DNS-туннель", "get_dns_tunnel"), ("📘 Руководство", "get_manual")]),
-    "support": ("💬 Поддержка", [("📬 Контакты", "show_contacts"), ("💳 Помощь с оплатой", "pay_help"), ("ℹ️ Условия", "show_info")]),
+    "support": ("💬 Поддержка", [("✉️ Написать администратору", "support_open"), ("📬 Контакты", "show_contacts"), ("💳 Помощь с оплатой", "pay_help"), ("ℹ️ Условия", "show_info")]),
 }
 
 def get_main_reply_keyboard():
@@ -293,6 +295,7 @@ def get_start_inline_keyboard():
 
 @dp.message(F.text.in_([v[0] for v in MENUS.values()]))
 async def section_reply(message):
+    support_sessions.pop(message.from_user.id, None)
     key = next(k for k,v in MENUS.items() if v[0] == message.text)
     await message.answer(MENUS[key][0], reply_markup=section_keyboard(key))
 
@@ -1004,6 +1007,7 @@ async def send_manual_pdf(target_message: types.Message):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    support_sessions.pop(message.from_user.id, None)
     await message.answer(
         f"Привет, {message.from_user.first_name}!\n\n"
         f"{TERMS_NOTICE}"
@@ -1157,6 +1161,147 @@ async def cb_manual(callback: types.CallbackQuery):
     except Exception as e:
         logging.error("Ошибка отправки руководства")
         await callback.message.answer("❌ Временная ошибка. Попробуйте позже или обратитесь в поддержку.")
+
+
+# ==================== ПОДДЕРЖКА ====================
+# Маршрут ответа подписан HMAC и хранится в сообщении бота у администратора.
+# Поэтому ответы на старые обращения работают даже после перезапуска.
+SUPPORT_ADMIN_ID = int(os.getenv("SUPPORT_ADMIN_ID", "0"))
+support_sessions = {}
+support_limits = {}
+support_global = []
+support_slots = asyncio.Semaphore(4)
+
+
+def support_tag(uid):
+    return hmac.new(BOT_TOKEN.encode(), f"support:{uid}".encode(), hashlib.sha256).hexdigest()[:24]
+
+
+def support_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖ Завершить обращение", callback_data="support_close")]])
+
+
+async def support_open(message, uid):
+    if not SUPPORT_ADMIN_ID or uid == SUPPORT_ADMIN_ID:
+        await message.answer("Для связи используйте контакты в разделе поддержки.")
+        return
+    now = time.monotonic()
+    for key, expiry in list(support_sessions.items()):
+        if expiry <= now:
+            support_sessions.pop(key, None)
+    if len(support_sessions) >= 5000 and uid not in support_sessions:
+        await message.answer("Поддержка сейчас загружена. Попробуйте чуть позже.")
+        return
+    support_sessions[uid] = now + 1800
+    await message.answer("✉️ Опишите проблему и приложите скриншоты, если нужно. Каждое сообщение отправляется администратору. Не присылайте пароли, QR-коды и ссылки подписок.\n\nДля выхода нажмите кнопку ниже или /cancel. Режим действует 30 минут.", reply_markup=support_keyboard())
+
+
+@dp.callback_query(F.data == "support_open")
+async def support_open_callback(callback):
+    await callback.answer()
+    await support_open(callback.message, callback.from_user.id)
+
+
+@dp.message(Command("myid"))
+async def support_myid(message):
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+
+
+@dp.message(Command("support"))
+async def support_open_command(message):
+    await support_open(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "support_close")
+async def support_close_callback(callback):
+    support_sessions.pop(callback.from_user.id, None)
+    await callback.answer()
+    await callback.message.answer("Режим отправки сообщений завершён. Ответ администратора всё равно придёт сюда.", reply_markup=get_main_reply_keyboard())
+
+
+@dp.message(Command("cancel"))
+async def support_cancel(message):
+    support_sessions.pop(message.from_user.id, None)
+    await message.answer("Режим отправки сообщений завершён.", reply_markup=get_main_reply_keyboard())
+
+
+def support_media_ok(message):
+    return bool(message.text or message.photo or (message.document and message.document.mime_type in {"image/png", "image/jpeg", "image/webp", "image/gif"} and (message.document.file_size or 0) <= 20 * 1024 * 1024))
+
+
+def support_route(message):
+    original = message.reply_to_message
+    if not original or original.reply_to_message or not original.from_user or original.from_user.id != bot.id:
+        return None
+    # Заголовок создаёт только бот. Пользовательский контент копируется отдельно.
+    text = original.text or ""
+    first = text.split("\n", 1)[0]
+    parts = first.split(":")
+    if len(parts) != 3 or parts[0] != "SUPPORT" or not parts[1].isdigit():
+        return None
+    uid = int(parts[1])
+    return uid if uid > 0 and uid != SUPPORT_ADMIN_ID and hmac.compare_digest(parts[2], support_tag(uid)) else None
+
+
+
+
+@dp.message(F.from_user.id == SUPPORT_ADMIN_ID, F.reply_to_message)
+async def support_admin_reply(message):
+    uid = support_route(message)
+    if not uid:
+        await message.answer("Ответьте на заголовок обращения SUPPORT, расположенный перед сообщением пользователя.")
+        return
+    if not support_media_ok(message):
+        await message.answer("Можно отправить текст или изображение.")
+        return
+    try:
+        await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+    except Exception as e:
+        logging.warning("Support reply failed: %s", type(e).__name__)
+        await message.answer("Ответ не доставлен. Возможно, пользователь заблокировал бота.")
+        return
+    await message.answer("✓ Ответ доставлен.")
+
+
+def support_is_active(message):
+    return bool(message.from_user and message.from_user.id != SUPPORT_ADMIN_ID and support_sessions.get(message.from_user.id, 0) > time.monotonic())
+
+
+@dp.message(support_is_active)
+async def support_receive(message):
+    uid = message.from_user.id
+    if not support_media_ok(message):
+        await message.answer("Пришлите текст, фото или изображение файлом до 20 МБ.")
+        return
+    now = time.monotonic()
+    for key, stamps in list(support_limits.items()):
+        if not stamps or now - stamps[-1] >= 60:
+            support_limits.pop(key, None)
+    stamps = support_limits.setdefault(uid, [])
+    stamps[:] = [t for t in stamps if now - t < 60]
+    support_global[:] = [t for t in support_global if now - t < 60]
+    if len(stamps) >= 8 or len(support_global) >= 40 or support_slots.locked():
+        await message.answer("Сообщение пока не отправлено. Подождите немного и повторите отправку.")
+        return
+    stamps.append(now)
+    support_global.append(now)
+    user = message.from_user
+    try:
+        async with support_slots:
+            header = await bot.send_message(SUPPORT_ADMIN_ID, f"SUPPORT:{uid}:{support_tag(uid)}\n✉️ Обращение от {user.full_name}\nTelegram ID: {uid}\nUsername: @{user.username}\nОтветьте на этот заголовок." if user.username else f"SUPPORT:{uid}:{support_tag(uid)}\n✉️ Обращение от {user.full_name}\nTelegram ID: {uid}\nОтветьте на этот заголовок.")
+            try:
+                await bot.copy_message(chat_id=SUPPORT_ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id, reply_parameters=types.ReplyParameters(message_id=header.message_id))
+            except Exception:
+                try:
+                    await header.delete()
+                except Exception:
+                    pass
+                raise
+    except Exception as e:
+        logging.warning("Support delivery failed: %s", type(e).__name__)
+        await message.answer("Не удалось доставить сообщение. Попробуйте позже или используйте контакты поддержки.")
+        return
+    await message.answer("✓ Сообщение передано администратору.")
 
 
 async def on_startup(bot: Bot):
