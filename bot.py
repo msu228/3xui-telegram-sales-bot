@@ -45,7 +45,15 @@ load_env_file()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_TOKEN = os.environ["API_TOKEN"]
-
+XUI_API_URL = os.environ["XUI_API_URL"]
+XUI_PUBLIC_URL=os.environ["XUI_PUBLIC_URL"]
+MANUAL_FILE_PATH = os.environ["MANUAL_FILE_PATH"]
+RESOLVERS_FILE_PATH = os.environ["RESOLVERS_FILE_PATH"]
+PROCESSED_PAYMENTS_FILE = os.environ["PROCESSED_PAYMENTS_FILE"]
+CONTACT_EMAIL = os.environ["CONTACT_EMAIL"]
+CONTACT_SIMPLEX = os.environ["CONTACT_SIMPLEX"]
+DNS_TUNNEL_SERVER = os.environ["DNS_TUNNEL_SERVER"]
+DNS_TUNNEL_PASSWORD = os.environ["DNS_TUNNEL_PASSWORD"]
 
 # Отключаем предупреждения о самоподписанном SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -53,10 +61,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==================== НАСТРОЙКИ ====================
 
 # Локальный URL панели (через который бот стучится на сервере под капотом)
-XUI_API_URL = "http://127.0.0.1:20655/hellfirefaphouse"
 
 # Публичный URL для клиентов без лишних путей
-XUI_PUBLIC_URL = "https://acidlab.top"
+#XUI_PUBLIC_URL = "https://acidlab.top"
 
 # Твой API-токен из панели (Настройки -> Безопасность -> API Token)
 
@@ -75,13 +82,8 @@ GROUP_PROMO = "promo"
 GROUP_PREMIUM = "premium"
 
 # Пути к файлам
-MANUAL_FILE_PATH = "/var/www/acidlab/network/instructions-secret1488/Manual.pdf"
-RESOLVERS_FILE_PATH = "/var/www/acidlab/network/instructions-secret1488/resolvers.txt"
-PROCESSED_PAYMENTS_FILE = "/root/xui-bot/processed_stars_payments.json"
 
 # Настройки DNS-туннеля
-DNS_TUNNEL_SERVER = "t.dirov.linkpc.net"
-DNS_TUNNEL_PASSWORD = "fdaf8606fa0a01a8be569a20b08e21d4"
 
 # 1 ТБ в представлении API панели (проверено на практике)
 PREMIUM_TOTAL_GB = 1099511627776
@@ -100,8 +102,6 @@ RENEW_REQUIRES_STARS = True
 STARS_RENEW_PRICE = 1
 
 # Контакты
-CONTACT_EMAIL = "spirtov-mnogo-ne-byvaet@proton.me"
-CONTACT_SIMPLEX = "https://smp15.simplex.im/a#gjDB-l5-iJvmMIS-QsT6dvPC3ZgATjZqUdUwr-khDmg"
 
 # Единое уведомление об условиях
 TERMS_NOTICE = "Пользуясь любыми услугами, вы соглашаетесь с условиями (см. Инфо).\n"
